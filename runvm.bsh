@@ -1,0 +1,94 @@
+#!/bin/bash
+
+[ $(id -u) = 0 ] || exit 255 ### root only
+
+LC_ALL=C ### prevent locale
+HOSTBRIDGE=br0 #### actual host bridge CHANGE it
+
+zfs=$(which zfs)
+ip=$(which ip)
+
+# sudo zfs create zpool/dataset/machine_name
+# sudo chown $USER zpool/dataset/machine_name
+# sudo zfs allow $USER clone,create,destroy,rollback,snapshot,diff,release,userprop zpool/dataset/machine_name ### userprop 
+# qemu-img create -f raw /zpool/dataset/machine_name/machine_name.raw
+# zfs set vmprop:cpu="host,kvm=off,hv_time,hv_relaxed,hv_spinlocks=0x1fff,hv_vpindex,hv_reset,hv_runtime,hv_crash,hv_vendor_id=freyja" zpool/dataset/machine_name
+# zfs set vmprop:smp="4,sockets=2,cores=2,threads=1" zpool/dataset/machine_name
+# zfs set vmprop:mem=2048 zpool/dataset/machine_name
+# zfs set vmprop:os=linux zpool/dataset/machine_name
+# zfs set vmprop:hostid=$(printf 'DE:AD:BE:EF:%02X:%02X\n' $((RANDOM%256)) $((RANDOM%256))) zpool/dataset/machine_name
+# zfs set vmprop:consoleport=5000 zpool/dataset/machine_name
+# zfs set vmprop:user=$USER zpool/dataset/machine_name
+# zfs set vmprop:pcie="0000:03:00.0,x-vga=off 0000:04:00.0,x-vga=off 0000:09:00.0,rombar=0 0000:09:00.1,rombar=0" zpool/dataset/machine_name
+
+function vm_pcie_setup() {
+	OLDIFS=$IFS
+	IFS=,
+	local dev
+	local opts
+	read dev opts <<< $1
+	echo $dev > "/sys/bus/pci/devices/${dev}/driver/unbind"
+	echo vfio-pci > "/sys/bus/pci/devices/${dev}/driver_override"
+	echo $dev > "/sys/bus/pci/drivers_probe"
+	chown $VMUSER /dev/vfio/$(basename `readlink -m /sys/bus/pci/devices/${dev}/iommu_group`) 
+	VMPCIEOPTS="$VMPCIEOPTS -device vfio-pci,host=$1"
+	IFS=$OLDIFS
+}
+
+
+_RUNVMSCRIPT=$(readlink -m $0)		## actual script
+_VMDIR=$(dirname $_RUNVMSCRIPT)		## actual VM directory
+VMNAME=${_VMDIR##*/}			## actual VM name
+VMBOOTDISK="${_VMDIR}/${VMNAME}.raw"
+_VMDATASET=$(cat /proc/mounts  | grep -w "$_VMDIR" | cut -d ' ' -f1)
+
+echo -en "Get vmproperties from $_VMDATASET:\t"
+VMCPU=$($zfs get -H -o value vmprop:cpu $_VMDATASET) ; [ ${VMCPU} == '-' ] && exit 
+VMSMP=$($zfs get -H -o value vmprop:smp $_VMDATASET) ; [ ${VMSMP} == '-' ] && exit
+VMMEM=$($zfs get -H -o value vmprop:mem $_VMDATASET) ; [ ${VMMEM} == '-' ] && exit
+VMHOSTID=$($zfs get -H -o value vmprop:hostid $_VMDATASET) ; [ $VMHOSTID == '-' ] && exit
+VMCONSOLEPORT=$($zfs get -H -o value vmprop:consoleport $_VMDATASET) ; [ ${VMCONSOLEPORT} == '-' ] && exit
+VMUSER=$($zfs get -H -o value vmprop:user $_VMDATASET ) ; [ $VMUSER == '-' ] && exit 
+VMOS=$($zfs get -H -o value vmprop:os $_VMDATASET ) ; [ $VMOS == '-' ] && exit
+VMPCIEIDS=($(zfs get -H -o value vmprop:pcie $_VMDATASET ))
+VMPCIEARGS=($(zfs get -H -o value vmprop:pcie:args $_VMDATASET ))
+echo "done."
+
+if [ -f $VMBOOTDISK ] ; then
+        chown $VMUSER $VMBOOTDISK
+	chmod 600 $VMBOOTDISK
+else
+        echo "No boot disk"
+        exit 254
+fi 
+
+if [ $VMPCIEIDS != '-' ] ; then
+	### VT-d already enabled, iommu added and so on...
+	sudo modprobe -i vfio-pci
+	for i in "${!VMPCIEIDS[@]}" ; do
+		vm_pcie_setup ${VMPCIEIDS[i]} ${VMPCIEARGS[i]}
+	done
+fi
+
+
+VMBOOTOPTS="-drive file=${VMBOOTDISK},index=0,discard=unmap,detect-zeroes=unmap,cache=none,format=raw,if=none,id=hd \
+	    -device virtio-scsi-pci,id=scsi -device scsi-hd,drive=hd"
+QEMUOPTS="-nodefaults -nographic -machine type=q35,accel=kvm -vga std -rtc base=localtime -k en-us"
+CONSOLEOPTS="-serial mon:telnet:localhost:${VMCONSOLEPORT},server,nowait"
+#CDROMOPTS="-drive file=/mnt/snooky/software/debian/debian-testing-amd64-netinst.iso,index=1,media=cdrom,cache=none,readonly" ### comment out
+
+echo -en "Creatng tap interface  ${VMNAME}0 over $HOSTBRIDGE by $VMUSER:\t"
+$ip tuntap add ${VMNAME}0 mode tap user $VMUSER
+$ip link set ${VMNAME}0 up
+$ip link set ${VMNAME}0 master $HOSTBRIDGE
+echo "done."
+NETOPTS="-netdev tap,id=${VMNAME}0,script=no,downscript=no,ifname=${VMNAME}0 -device virtio-net-pci,netdev=${VMNAME}0,mac=${VMHOSTID}"
+
+echo -e "Starting VM $VMNAME, console port $VMCONSOLEPORT."
+su - $VMUSER -c "qemu-system-x86_64 $QEMUOPTS -name $VMNAME -cpu $VMCPU -smp $VMSMP -m $VMMEM $VMBOOTOPTS $CDROMOPTS $CONSOLEOPTS $NETOPTS $VMPCIEOPTS"
+
+### clean up
+echo -en "Destroying tap interface ${VMNAME}0:"
+$ip tuntap del ${VMNAME}0 mode tap
+echo "done."
+
