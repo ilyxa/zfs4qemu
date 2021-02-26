@@ -1,12 +1,17 @@
 #!/bin/bash
+#$ver:0.2
+# v0.1 linux legacy BIOS support, debug
+# v0.2 linux-uefi support, basic function, logging
 
 [ $(id -u) = 0 ] || exit 255 ### root only
 
-LC_ALL=C ### prevent locale
-HOSTBRIDGE=br0 #### actual host bridge CHANGE it
+LC_ALL=C ### explict locale
 
 zfs=$(which zfs)
 ip=$(which ip)
+modprobe=$(which modprobe)
+
+HOSTBRIDGE=br0 #### actual host bridge, CHANGE it
 
 # sudo zfs create zpool/dataset/machine_name
 # sudo chown $USER zpool/dataset/machine_name
@@ -14,12 +19,35 @@ ip=$(which ip)
 # qemu-img create -f raw /zpool/dataset/machine_name/machine_name.raw
 # zfs set vmprop:cpu="host,kvm=off,hv_time,hv_relaxed,hv_spinlocks=0x1fff,hv_vpindex,hv_reset,hv_runtime,hv_crash,hv_vendor_id=freyja" zpool/dataset/machine_name
 # zfs set vmprop:smp="4,sockets=2,cores=2,threads=1" zpool/dataset/machine_name
-# zfs set vmprop:mem=2048 zpool/dataset/machine_name
+# zfs set vmprop:mem=2048M,slots=3,maxmem=4G zpool/dataset/machine_name
 # zfs set vmprop:os=linux zpool/dataset/machine_name
 # zfs set vmprop:hostid=$(printf 'DE:AD:BE:EF:%02X:%02X\n' $((RANDOM%256)) $((RANDOM%256))) zpool/dataset/machine_name
 # zfs set vmprop:consoleport=5000 zpool/dataset/machine_name
 # zfs set vmprop:user=$USER zpool/dataset/machine_name
 # zfs set vmprop:pcie="0000:03:00.0,x-vga=off 0000:04:00.0,x-vga=off 0000:09:00.0,rombar=0 0000:09:00.1,rombar=0" zpool/dataset/machine_name
+# zfs set vmprop:gvtg="" zpool/dataset/machine_name # 
+
+_RUNVMSCRIPT=$(readlink -m $0)		## actual script always located in vm dataset, symlinked in ~/bin
+_VMDIR=$(dirname $_RUNVMSCRIPT)		## actual VM directory
+VMNAME=${_VMDIR##*/}			## actual VM name
+_VMDATASET=$(cat /proc/mounts  | grep -w "$_VMDIR" | cut -d ' ' -f1)
+
+#silent=yes      # uncomment for silent mode
+#debug=yes      # uncomment for debug
+
+[ -z ${debug:+x} ] || set -x
+[ -z ${silent:+x} ] || { # tbd
+        [ -d ${_VMDIR}/logs ] || mkdir ${_VMDIR}/logs
+        log_file="${_VMDIR}/logs/`basename $0`.txt-`date +'%Y-%m-%d_%H-%M-%S'`"
+        [ -f "$log_file" ] || touch "$log_file"
+        exec 1>> $log_file 2>&1 & # silent mode
+#       nohup -pa $$
+        exec &> >(tee -a "$log_file")
+}
+
+defaultVMCPU="host,kvm=off,hv_time,hv_relaxed,hv_spinlocks=0x1fff,hv_vpindex,hv_reset,hv_runtime,hv_crash,hv_vendor_id=freyja"
+defaultVMSMP="4,sockets=2,cores=2,threads=1"
+defaultVMMEM="2048M,slots=3,maxmem=4G"
 
 function vm_pcie_setup() {
 	OLDIFS=$IFS
@@ -27,7 +55,7 @@ function vm_pcie_setup() {
 	local dev
 	local opts
 	read dev opts <<< $1
-	echo $dev > "/sys/bus/pci/devices/${dev}/driver/unbind"
+	[ -h "/sys/bus/pci/devices/${dev}/driver/unbind" ] && echo $dev > "/sys/bus/pci/devices/${dev}/driver/unbind"
 	echo vfio-pci > "/sys/bus/pci/devices/${dev}/driver_override"
 	echo $dev > "/sys/bus/pci/drivers_probe"
 	chown $VMUSER /dev/vfio/$(basename `readlink -m /sys/bus/pci/devices/${dev}/iommu_group`) 
@@ -35,60 +63,156 @@ function vm_pcie_setup() {
 	IFS=$OLDIFS
 }
 
+function create_tap_interface() {
+	echo -en "Creatng tap interface  ${VMNAME}0 over $HOSTBRIDGE by $VMUSER:\t"
+	$ip tuntap add ${VMNAME}0 mode tap user $VMUSER
+	$ip link set ${VMNAME}0 up
+	$ip link set ${VMNAME}0 master $HOSTBRIDGE
+	echo "done."
+}
 
-_RUNVMSCRIPT=$(readlink -m $0)		## actual script
-_VMDIR=$(dirname $_RUNVMSCRIPT)		## actual VM directory
-VMNAME=${_VMDIR##*/}			## actual VM name
+function term() {
+	echo Terminated...
+	cleanup
+}
+
+function cleanup() {
+	echo -en "Destroying tap interface ${VMNAME}0:"
+	$ip tuntap del ${VMNAME}0 mode tap
+	echo "done."
+	if [ $VMINTELGVTG != '-' ] ; then
+		echo -en "Cleanup GVT-g:\t"
+		echo 1 | sudo tee /sys/bus/mdev/devices/$GVTG_UUID/remove
+		echo "done."
+	fi
+	### vfio cleanup TBD
+	exit 0
+}
+function get_vmdataset_props() {
+	echo -en "Get vmproperties from $_VMDATASET:\t"
+	# this option is uniq for each VM
+	VMHOSTID=$($zfs get -H -o value vmprop:hostid $_VMDATASET) ; [ $VMHOSTID == '-' ] && { echo "No hostid defined" ; exit 3; } #Explict option - do not continue
+	VMOS=$($zfs get -H -o value vmprop:os $_VMDATASET ) ; [ $VMOS == '-' ] && { echo "No OS type defined" ; exit 3; } #Explict option - term
+	# this options can be defaulted
+	VMCPU=$($zfs get -H -o value vmprop:cpu $_VMDATASET) ; [ ${VMCPU} == '-' ] && { echo "No CPU option defined, using defaults: $defaultVMCPU" ; VMCPU=defaultVMCPU; }
+	VMSMP=$($zfs get -H -o value vmprop:smp $_VMDATASET) ; [ ${VMSMP} == '-' ] && { echo "No SMP option defined, using defaults: $defaultVMSMP" ; VMSMP=defaultVMSMP; }
+	VMMEM=$($zfs get -H -o value vmprop:mem $_VMDATASET) ; [ ${VMMEM} == '-' ] && { echo "No Mem option defined, using defaults: $defaultVMMEM" ; VMMEM=defaultVMMEM; }
+	# TBD its possible to run VM w/o console port, option is uniq for each VM
+	VMCONSOLEPORT=$($zfs get -H -o value vmprop:consoleport $_VMDATASET) ; [ ${VMCONSOLEPORT} == '-' ] && { echo "No console port defined"; } ### TODO for win
+	# must set anyway, never running under root
+	VMUSER=$($zfs get -H -o value vmprop:user $_VMDATASET ) ; [ $VMUSER == '-' ] && { 
+		echo "No user defined!" 
+		if [ ! -z ${SUDO_USER+x} ] ; then
+			echo " * Please define vmprop:user in  $_VMDATASET. Terminating"
+			exit 3
+		else
+			VMUSER=$SUDO_USER # i'm using sudo for script
+		fi
+	}
+	# optional options ;)
+	# in pairs VMPCIEIDS[@]=VMPCIEARGS[@]
+	VMPCIEIDS=($(zfs get -H -o value vmprop:pcie $_VMDATASET ))
+	VMPCIEARGS=($(zfs get -H -o value vmprop:pcie:args $_VMDATASET ))
+	# mainly for win10 guest
+	VMINTELGVTG=($(zfs get -H -o value vmprop:gvtg $_VMDATASET ))
+	echo "done."
+}
+
+trap term SIGINT
+
+# select right ISO, if Win10 not installed - always attach 2nd cdrom w/ VirtIO drivers
+# VirtIO ISO: https://github.com/virtio-win/virtio-win-pkg-scripts/blob/master/README.md
+#ISO2=/mnt/snooky/software/virtio/virtio-win-0.1.190.iso
+#ISO1=/mnt/snooky/software/ms/Win10_20H2_v2_English_x64.iso 
+#ISO1="/mnt/snooky/software/debian/debian-10.8.0-amd64-netinst.iso"
+
+# define boot disk
 VMBOOTDISK="${_VMDIR}/${VMNAME}.raw"
-_VMDATASET=$(cat /proc/mounts  | grep -w "$_VMDIR" | cut -d ' ' -f1)
+# TBD add more disk
 
-echo -en "Get vmproperties from $_VMDATASET:\t"
-VMCPU=$($zfs get -H -o value vmprop:cpu $_VMDATASET) ; [ ${VMCPU} == '-' ] && exit 
-VMSMP=$($zfs get -H -o value vmprop:smp $_VMDATASET) ; [ ${VMSMP} == '-' ] && exit
-VMMEM=$($zfs get -H -o value vmprop:mem $_VMDATASET) ; [ ${VMMEM} == '-' ] && exit
-VMHOSTID=$($zfs get -H -o value vmprop:hostid $_VMDATASET) ; [ $VMHOSTID == '-' ] && exit
-VMCONSOLEPORT=$($zfs get -H -o value vmprop:consoleport $_VMDATASET) ; [ ${VMCONSOLEPORT} == '-' ] && exit
-VMUSER=$($zfs get -H -o value vmprop:user $_VMDATASET ) ; [ $VMUSER == '-' ] && exit 
-VMOS=$($zfs get -H -o value vmprop:os $_VMDATASET ) ; [ $VMOS == '-' ] && exit
-VMPCIEIDS=($(zfs get -H -o value vmprop:pcie $_VMDATASET ))
-VMPCIEARGS=($(zfs get -H -o value vmprop:pcie:args $_VMDATASET ))
-echo "done."
+get_vmdataset_props
 
+# prepare boot disk
 if [ -f $VMBOOTDISK ] ; then
-        chown $VMUSER $VMBOOTDISK
+	chown $VMUSER $VMBOOTDISK
 	chmod 600 $VMBOOTDISK
 else
-        echo "No boot disk"
-        exit 254
+	echo "No boot disk"
+	exit 254
 fi 
 
+# prepare vfio if exist
 if [ $VMPCIEIDS != '-' ] ; then
 	### VT-d already enabled, iommu added and so on...
-	sudo modprobe -i vfio-pci
+	$modprobe -i vfio-pci
 	for i in "${!VMPCIEIDS[@]}" ; do
 		vm_pcie_setup ${VMPCIEIDS[i]} ${VMPCIEARGS[i]}
 	done
 fi
 
+# prepare GVT-g if exist
+if [ $VMINTELGVTG != '-' ] ; then
+	$modprobe -i kvmgt
+	$modprobe -i vfio-iommu-type1
+	$modprobe -i vfio-mdev
 
-VMBOOTOPTS="-drive file=${VMBOOTDISK},index=0,discard=unmap,detect-zeroes=unmap,cache=none,format=raw,if=none,id=hd \
-	    -device virtio-scsi-pci,id=scsi -device scsi-hd,drive=hd"
-QEMUOPTS="-nodefaults -nographic -machine type=q35,accel=kvm -vga std -rtc base=localtime -k en-us"
-CONSOLEOPTS="-serial mon:telnet:localhost:${VMCONSOLEPORT},server,nowait"
-#CDROMOPTS="-drive file=/mnt/snooky/software/debian/debian-testing-amd64-netinst.iso,index=1,media=cdrom,cache=none,readonly" ### comment out
+	GVT=$VMINTELGVTG ## lspci -D -nn
+	PCI_DOMAIN=${GVT:0:7}
+	GVTG_UUID=$($uuidgen)
+	echo $GVTG_UUID | sudo tee  "/sys/devices/pci${PCI_DOMAIN}/${GVT}/mdev_supported_types/i915-GVTg_V5_4/create"
+	sudo chown $VMUSER /dev/vfio/$(basename `readlink -m /sys/bus/mdev/devices/$GVTG_UUID/iommu_group`)
+fi
 
-echo -en "Creatng tap interface  ${VMNAME}0 over $HOSTBRIDGE by $VMUSER:\t"
-$ip tuntap add ${VMNAME}0 mode tap user $VMUSER
-$ip link set ${VMNAME}0 up
-$ip link set ${VMNAME}0 master $HOSTBRIDGE
-echo "done."
-NETOPTS="-netdev tap,id=${VMNAME}0,script=no,downscript=no,ifname=${VMNAME}0 -device virtio-net-pci,netdev=${VMNAME}0,mac=${VMHOSTID}"
+case $VMOS in
+	linux*)
+		# any linux - create tap interface, create console port
+		## native UNMAP support for thin provisioned volumes
+		VMBOOTOPTS="-device virtio-scsi-pci,id=scsi0 \
+					-drive file=${VMBOOTDISK},if=none,format=raw,discard=unmap,aio=native,cache=none,id=bootdisk \
+					-device scsi-hd,drive=bootdisk,bus=scsi0.0"
+		
+		[ ${VMCONSOLEPORT} == '-' ] || { 
+			# screen //telnet localhost <port> 
+			ss -Htln src :${VMCONSOLEPORT} | grep LISTEN > /dev/null 
+			if [ $? == 1 ] ; then
+				CONSOLEOPTS="-serial mon:telnet:localhost:${VMCONSOLEPORT},server,nowait"
+			else
+				echo "Console port already in use, terminating."
+				echo 3
+			fi
+		}
+		# own interface naming scheme
+		create_tap_interface
+		NETOPTS="-netdev tap,id=${VMNAME}0,script=no,downscript=no,ifname=${VMNAME}0 -device virtio-net-pci,netdev=${VMNAME}0,mac=${VMHOSTID}"
+		# basic qemu opts
+		QEMUOPTS="-nodefaults -nographic -machine type=q35,accel=kvm,kernel_irqchip -rtc base=localtime -k en-us" 		
+		;;&
+	linux-legacy)
+		QEMUOPTS="${QEMUOPTS} -vga std"
+		;;
+	linux-efi)
+		### add Open Virtual Machine Firmware file (please use your own location)
+		QEMUOPTS="${QEMUOPTS}  -vga none -bios /usr/share/ovmf/x64/OVMF.fd"
+		;;
+	linux-*)
+		#stub, anyway, we can failover to bios settings if we need
+		echo "BIOS type not defined, terminating"
+		exit 3
+		;;
+	win*)
+		### T.B.D.
+		
+		;;&
+	*)
+		echo "unknown os"
+		exit 2
+esac
+
+# add ISO as you need
+[ -z ${ISO1+x} ] || CDROMOPTS="-drive file=${ISO},index=1,media=cdrom,cache=none,readonly"
+[ -z ${ISO2+x} ] || CDROMOPTS="-drive file=${ISO},index=2,media=cdrom,cache=none,readonly"
 
 echo -e "Starting VM $VMNAME, console port $VMCONSOLEPORT."
 su - $VMUSER -c "qemu-system-x86_64 $QEMUOPTS -name $VMNAME -cpu $VMCPU -smp $VMSMP -m $VMMEM $VMBOOTOPTS $CDROMOPTS $CONSOLEOPTS $NETOPTS $VMPCIEOPTS"
 
-### clean up
-echo -en "Destroying tap interface ${VMNAME}0:"
-$ip tuntap del ${VMNAME}0 mode tap
-echo "done."
-
+cleanup
