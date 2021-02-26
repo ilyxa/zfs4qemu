@@ -209,8 +209,8 @@ case $VMOS in
 esac
 
 # add ISO as you need
-[ -z ${ISO1+x} ] || CDROMOPTS="-drive file=${ISO},index=1,media=cdrom,cache=none,readonly"
-[ -z ${ISO2+x} ] || CDROMOPTS="-drive file=${ISO},index=2,media=cdrom,cache=none,readonly"
+[ -z ${ISO1+x} ] || CDROMOPTS="-drive file=${ISO1},index=1,media=cdrom,cache=none,readonly"
+[ -z ${ISO2+x} ] || CDROMOPTS="${CDROMOPTS} -drive file=${ISO2},index=2,media=cdrom,cache=none,readonly"
 
 echo -e "Starting VM $VMNAME, console port $VMCONSOLEPORT."
 su - $VMUSER -c "qemu-system-x86_64 $QEMUOPTS -name $VMNAME -cpu $VMCPU -smp $VMSMP -m $VMMEM $VMBOOTOPTS $CDROMOPTS $CONSOLEOPTS $NETOPTS $VMPCIEOPTS"
