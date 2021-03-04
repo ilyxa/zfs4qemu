@@ -1,0 +1,208 @@
+#!/bin/bash
+
+LC_ALL=C
+
+DATE="$(date -u)"
+DATEUNIX="$(date +%s)"
+VER="0.1"
+DATASTORE="storarray/local/vms/qemu"
+QEMU="qemu-system-x86_64 \\\\\n"
+QEMUARGS="-nodefaults -machine type=q35,accel=kvm,kernel_irqchip -rtc base=localtime -k en-us \\\\\n"
+HOSTBRIDGE=br0
+NATNET="" # TODO
+
+defaultVMCPU="host,kvm=off,hv_time,hv_relaxed,hv_spinlocks=0x1fff,hv_vpindex,hv_reset,hv_runtime,hv_crash,hv_vendor_id=freyja"
+defaultVMSMP="2,sockets=1,cores=2,threads=1"
+defaultVMMEM="2048M,slots=3,maxmem=4G"
+
+declare -a VMDATASET
+declare -a VMPROP
+
+function template_mem_smp_cpu() {
+	[ ${VMMEM} == '-' ] && { echo "No Mem option defined, using defaults: $defaultVMMEM" ; VMMEM=$defaultVMMEM; }
+	[ ${VMSMP} == '-' ] && { echo "No SMP option defined, using defaults: $defaultVMSMP" ; VMSMP=$defaultVMSMP; }
+	[ ${VMCPU} == '-' ] && { echo "No CPU option defined, using defaults: $defaultVMCPU" ; VMCPU=$defaultVMCPU; }
+	QEMUOPTS="${QEMUOPTS} -m $VMMEM \\\\\n"
+	QEMUOPTS="${QEMUOPTS} -cpu $VMCPU \\\\\n"
+	QEMUOPTS="${QEMUOPTS} -smp $VMSMP \\\\\n"
+}
+
+function template_network() {
+	# 
+		#NETOPTS="-netdev tap,id=${VMNAME}0,script=no,downscript=no,ifname=${VMNAME}0 -device virtio-net-pci,netdev=${VMNAME}0,mac=${VMHOSTID}"
+		# NAT
+		#-netdev user,id=nat0,net=192.168.76.0/24,dhcpstart=192.168.76.9,hostfwd=tcp::3389-:3389 \
+		#-device virtio-net-pci,netdev=nat0 \
+
+		# Bridge
+		#-netdev bridge,br=$HOSTBRIDGE,id=bridge0 \
+		#-device virtio-net-pci,netdev=bridge0
+		#
+	NETWORKCLIUP=""
+	NETWORKCLIDOWN=""
+	
+	case $VMNET in
+	"bridge")
+		# Bridge
+		NETWORKCLIUP="sudo ip tuntap add ${VMNAME}0 mode tap user $VMUSER\n"
+		NETWORKCLIUP="${NETWORKCLIUP}sudo ip link set ${VMNAME}0 up\n"
+		NETWORKCLIUP="${NETWORKCLIUP}sudo ip link set ${VMNAME}0 master $HOSTBRIDGE\n"
+		NETWORKCLIDOWN="sudo ip tuntap del ${VMNAME}0 mode tap\n"
+		
+		QEMUOPTS="${QEMUOPTS} -netdev tap,id=${VMNAME}0,script=no,downscript=no,ifname=${VMNAME}0 -device virtio-net-pci,netdev=${VMNAME}0,mac=${VMHOSTID} \\\\\n"
+		;;
+	"nat")
+		# NAT
+		QEMUOPTS="${QEMUOPTS} -netdev user,id=nat0,net=192.168.76.0/24,dhcpstart=192.168.76.9,hostfwd=tcp::3389-:3389 \\\\\n"
+		QEMUOPTS="${QEMUOPTS} -device virtio-net-pci,netdev=nat0 \\\\\n"
+		;;
+	esac
+}
+
+function template_efi {
+	QEMUOPTS="${QEMUOPTS} -bios /usr/share/ovmf/x64/OVMF.fd \\\\\n"
+}
+
+function template_disk() {
+	QEMUOPTS="${QEMUOPTS} -device virtio-scsi-pci,id=scsi0 \\\\\n"
+	QEMUOPTS="${QEMUOPTS} -drive file=${VMBOOTDISK},if=none,format=raw,discard=unmap,aio=native,cache=none,id=bootdisk \\\\\n"
+	QEMUOPTS="${QEMUOPTS} -device scsi-hd,drive=bootdisk,bus=scsi0.0\n"
+	#~ "hide" disk: device_id=scsiHDD,product=SCSI_disk,serial=$(uuidgen),vendor=ANY_disk,ver=1.0
+}
+
+function template_iso() {
+	QEMUOPTS="${QEMUOPTS} -drive file=$BLANKISO,index=1,media=cdrom,cache=none,readonly \\\\\n"
+	[ "$1" == "win" ] && QEMUOPTS="${QEMUOPTS} -drive file=$BLANKISO,index=2,media=cdrom,cache=none,readonly \\\\\n"
+}
+
+function template_pcie() {
+	PCIECLIUP=""
+	PCIECLIDOWN=""
+	if [ "$VMPCIEIDS" != '-' ] ; then
+		PCIECLIUP="sudo modprobe -i vfio-pci\n"
+		for i in "${!VMPCIEIDS[@]}" ; do
+			OLDIFS=$IFS
+			IFS=,
+			local dev
+			local opts
+			read dev opts <<< ${VMPCIEIDS[i]}
+			[ -h "/sys/bus/pci/devices/${dev}/driver/unbind" ] || PCIECLIUP="${PCIECLIUP}echo $dev | sudo tee \"/sys/bus/pci/devices/${dev}/driver/unbind\"\n"
+			PCIECLIUP="${PCIECLIUP}echo vfio-pci | sudo tee \"/sys/bus/pci/devices/${dev}/driver_override\"\n"
+			PCIECLIUP="${PCIECLIUP}echo $dev | sudo tee \"/sys/bus/pci/drivers_probe\"\n"
+			PCIECLIUP="${PCIECLIUP}sudo chown $VMUSER /dev/vfio/$(basename `readlink -m /sys/bus/pci/devices/${dev}/iommu_group`)\n"
+			QEMUOPTS="${QEMUOPTS} -device vfio-pci,host=${VMPCIEIDS[i]}\\\\\n"
+			IFS=$OLDIFS
+		done
+	fi
+}
+
+template_os() {
+	case $VMOS in
+		linux*)
+			QEMUOPTS="${QEMUOPTS} -nographic \\\\\n"
+			[ $VMCONSOLE == '-' ] || { 
+				# screen //telnet localhost <port> 
+				ss -Htln src :$1 | grep LISTEN > /dev/null 
+				if [ $? == 0 ] ; then
+					QEMUOPTS="${QEMUOPTS} -serial mon:telnet:localhost:${VMCONSOLE},server,nowait \\\\\n"
+				else
+					echo "Console port already in use, terminating."
+				fi
+			}
+			template_iso
+		;;&
+		linux-legacy)
+			QEMUOPTS="${QEMUOPTS} -vga std \\\\\n"
+		;;
+		linux-efi)
+			QEMUOPTS="${QEMUOPTS} -vga none \\\\\n"
+			template_efi
+		;;
+		linux-*)
+			echo "BIOS type not defined, terminating"
+			QEMUOPTS="NA"
+		;;
+		win*)
+			QEMUOPTS="${QEMUOPTS} -device qemu-xhci,id=xhci \\\\\n"
+			QEMUOPTS="${QEMUOPTS} -device usb-tablet,bus=xhci.0 \\\\\n"
+			QEMUOPTS="${QEMUOPTS} -monitor stdio \\\\\n"
+			template_iso win
+			[ $VMCONSOLE == '-' ] || { 
+				QEMUOPTS="${QEMUOPTS} -vga qxl \\\\\n"
+				QEMUOPTS="${QEMUOPTS} -device virtio-serial-pci \\\\\n"
+				QEMUOPTS="${QEMUOPTS} -spice port=$VMCONSOLE,disable-ticketing \\\\\n"
+				QEMUOPTS="${QEMUOPTS} -device virtserialport,chardev=spicechannel0,name=com.redhat.spice.0 \\\\\n"
+				QEMUOPTS="${QEMUOPTS} -chardev spicevmc,id=spicechannel0,name=vdagent \\\\\n"
+			}
+		;;
+		win-efi)
+			template_efi
+			;;
+		*)
+		QEMUOPTS="NA"
+	esac
+}
+
+#~ create blank.iso in $DATASTORE mountpoint
+DATASTOREMOUNTPOINT=$(zfs get -H -o value mountpoint $DATASTORE)
+BLANKISO="$DATASTOREMOUNTPOINT/blank.iso"
+[ -f $BLANKISO ] || {
+	mkdir /tmp/blank-iso_tmp_${DATEUNIX}
+	mkisofs -o $BLANKISO -V blank /tmp/blank-iso_tmp_${DATEUNIX}
+	rmdir /tmp/blank-iso_tmp_${DATEUNIX}
+}
+
+IFS=$'\n' read -r -d '' -a VMDATASET < <( zfs list -r -H -p -o name  $DATASTORE | grep -v ${DATASTORE}$ ; printf '\0' )
+for i in ${!VMDATASET[@]}; do
+	IFS=$'\n' read -r -d '' -a VMPROP < <(	zfs get -H -o value mountpoint,vmprop:os,vmprop:consoleport,vmprop:hostid,vmprop:user,vmprop:mem,vmprop:smp,vmprop:cpu,vmprop:net,vmprop:pcie ${VMDATASET[i]} ; printf '\0' )
+	QEMUOPTS="$QEMU $QEMUARGS"
+	VMMOUNTPOINT=${VMPROP[0]}
+	VMNAME=$(basename $VMMOUNTPOINT)
+	VMBOOTDISK=$VMMOUNTPOINT/${VMNAME}.raw
+	VMOS=${VMPROP[1]}
+	VMCONSOLE=${VMPROP[2]}
+	VMHOSTID=${VMPROP[3]}
+	VMUSER=${VMPROP[4]}
+	VMMEM=${VMPROP[5]}
+	VMSMP=${VMPROP[6]}
+	VMCPU=${VMPROP[7]}
+	VMNET=${VMPROP[8]}
+	VMPCIEIDS=(${VMPROP[9]})
+	
+	echo -e "VM name: \t\t$VMNAME"
+	template_os
+	[ "$QEMUOPTS" == 'NA' ] && { continue; }
+	template_mem_smp_cpu
+	template_network
+	template_pcie
+	template_disk
+	
+	echo "BEGIN script $VMMOUNTPOINT/run.bsh"
+	( exec > $VMMOUNTPOINT/run.bsh
+	echo -e "#!/bin/bash"
+	echo -e "# ${DATE}"
+	echo -e "# \$ver:\t${VER}"
+	echo -e "# Console/SPICE port:\t${VMCONSOLE}"
+	echo -e "# Network type:\t${VMNET}"
+	echo -e "# Add ISO (copy/paste BEFORE start VM):"
+	echo -e "# -drive file=/mnt/snooky/software/ms/Win10_20H2_v2_English_x64.iso,index=1,media=cdrom,cache=none,readonly \""
+	echo -e "# -drive file=/mnt/snooky/software/debian/debian-10.8.0-amd64-netinst.iso,index=1,media=cdrom,cache=none,readonly \""
+	echo -e "# -drive file=/mnt/snooky/software/virtio/virtio-win-0.1.190.iso,index=2,media=cdrom,cache=none,readonly \""
+	echo -e "# Linux Guest Serial Console:"
+	echo -e "# screen -t $VMNAME //group ; screen -t runscript $VMNAME/run.bsh ; sleep 1 ; screen -t console //telnet localhost $VMCONSOLE"
+	echo -e "# Windows SPICE Console:"
+	echo -e "# screen -t $VMNAME //group ; screen -t runscript $VMNAME/run.bsh ; sleep 1 ; screen -t consolespicy -h localhost -p $VMCONSOLE"
+	echo -e "#\n"
+
+	echo -e "sudo chown $VMUSER $VMBOOTDISK\n"
+	echo -e "$NETWORKCLIUP\n"
+	echo -e "$PCIECLIUP\n"
+	echo -e "$QEMUOPTS"
+	echo -e "$NETWORKCLIDOWN\n"
+	echo -e "$PCIECLIDOWN\n"
+	)
+	echo "END script"
+	chmod +x  $VMMOUNTPOINT/run.bsh
+done
+
+exit 0
