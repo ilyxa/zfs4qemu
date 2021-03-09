@@ -4,25 +4,29 @@
 #
 LC_ALL=C
 
-DATE="$(date -u)"
+#DATE="$(date -u)"
 DATEUNIX="$(date +%s)"
+DATE="$(date -u --date=@${DATEUNIX})"
 VER="0.1"
 DATASTORE="storarray/local/vms/qemu"
 QEMU="qemu-system-x86_64 \\\\\n"
 QEMUARGS="-nodefaults -machine type=q35,accel=kvm,kernel_irqchip -rtc base=localtime -k en-us \\\\\n"
 HOSTBRIDGE=br0
-NATNET="192.168.76.0/24" # TODO
-# some dirty code... here
-OLDIFS=$IFS
-IFS="."
-read           -a NATNETTMP <<< $NATNET
-NATNETDHCPSTART="${NATNETTMP[0]}.${NATNETTMP[1]}.${NATNETTMP[2]}.9"
-unset NATNETTMP
-IFS=$OLDIFS
-
+NATNET="192.168.76.0/24"
 defaultVMCPU="host,kvm=off,hv_time,hv_relaxed,hv_spinlocks=0x1fff,hv_vpindex,hv_reset,hv_runtime,hv_crash,hv_vendor_id=freyja"
 defaultVMSMP="2,sockets=1,cores=2,threads=1"
 defaultVMMEM="2048M,slots=3,maxmem=4G"
+
+DATASTOREMOUNTPOINT=$(zfs get -H -o value mountpoint $DATASTORE)
+BLANKISO="$DATASTOREMOUNTPOINT/blank.iso"
+
+# some dirty code... here
+OLDIFS=$IFS
+IFS="."
+read -a NATNETTMP <<< $NATNET
+NATNETDHCPSTART="${NATNETTMP[0]}.${NATNETTMP[1]}.${NATNETTMP[2]}.9"
+unset NATNETTMP
+IFS=$OLDIFS
 
 function template_mem_smp_cpu() {
 	[ ${VMMEM} == '-' ] && {
@@ -43,8 +47,6 @@ function template_mem_smp_cpu() {
 }
 
 function template_network_nat_portfwd() {
-	# TODO
-	
 	if [ "$VMNETPORTFWD" != '-' ]; then
 		for i in "${!VMNETPORTFWD[@]}"; do
 			local hostport
@@ -52,24 +54,17 @@ function template_network_nat_portfwd() {
 			OLDIFS=$IFS
 			IFS=":"
 			read hostport guestport <<< ${VMNETPORTFWD[i]}
-			echo -n ",hostfwd=tcp::${hostport}-:${guestport} "
+			echo -n ",hostfwd=tcp::${hostport}-:${guestport}"
 			IFS=$OLDIFS
 		done
+		return 0
+	else
+		echo -en
+		return 1
 	fi
 }
 
-
 function template_network() {
-	#
-	#NETOPTS="-netdev tap,id=${VMNAME}0,script=no,downscript=no,ifname=${VMNAME}0 -device virtio-net-pci,netdev=${VMNAME}0,mac=${VMHOSTID}"
-	# NAT
-	#-netdev user,id=nat0,net=192.168.76.0/24,dhcpstart=192.168.76.9,hostfwd=tcp::3389-:3389 \
-	#-device virtio-net-pci,netdev=nat0 \
-
-	# Bridge
-	#-netdev bridge,br=$HOSTBRIDGE,id=bridge0 \
-	#-device virtio-net-pci,netdev=bridge0
-	#
 	NETWORKCLIUP=""
 	NETWORKCLIDOWN=""
 
@@ -80,14 +75,14 @@ function template_network() {
 			NETWORKCLIUP="${NETWORKCLIUP}sudo ip link set ${VMNAME}0 master $HOSTBRIDGE\n"
 			NETWORKCLIDOWN="sudo ip tuntap del ${VMNAME}0 mode tap\n"
 
-			QEMUOPTS="${QEMUOPTS} -netdev tap,id=${VMNAME}0,script=no,downscript=no,ifname=${VMNAME}0 -device virtio-net-pci,netdev=${VMNAME}0,mac=${VMHOSTID} \\\\\n"
+			QEMUOPTS="${QEMUOPTS} -netdev tap,id=${VMNAME}0,script=no,downscript=no,ifname=${VMNAME}0 \\\\\n"
+			QEMUOPTS="${QEMUOPTS} -device virtio-net-pci,netdev=${VMNAME}0,speed=100,mac=${VMHOSTID} \\\\\n"
 			;;
 		"nat")
-			# TODO hostfwd
 			local portfwd
-			portfwd=$(template_network_nat_portfwd)
-			QEMUOPTS="${QEMUOPTS} -netdev user,id=nat0,net=$NATNET,dhcpstart=${NATNETDHCPSTART}${portfwd} \\\\\n"
-			QEMUOPTS="${QEMUOPTS} -device virtio-net-pci,netdev=nat0 \\\\\n"
+#			portfwd=$(template_network_nat_portfwd)
+			QEMUOPTS="${QEMUOPTS} -netdev user,id=${VMNAME}0,net=$NATNET,dhcpstart=${NATNETDHCPSTART}$(template_network_nat_portfwd) \\\\\n"
+			QEMUOPTS="${QEMUOPTS} -device virtio-net-pci,netdev=${VMNAME}0,speed=100,mac=${VMHOSTID} \\\\\n"
 			;;
 	esac
 }
@@ -98,9 +93,11 @@ function template_efi {
 
 function template_disk() {
 	QEMUOPTS="${QEMUOPTS} -device virtio-scsi-pci,id=scsi0 \\\\\n"
-	QEMUOPTS="${QEMUOPTS} -drive file=${VMBOOTDISK},if=none,format=raw,discard=unmap,aio=native,cache=none,id=bootdisk \\\\\n"
+	QEMUOPTS="${QEMUOPTS} -drive file=${VMBOOTDISK},if=none,format=raw,discard=unmap,aio=native,cache=none,id=bootdisk,throttling.bps-total=50331648,throttling.iops-total=4096 \\\\\n"
 	QEMUOPTS="${QEMUOPTS} -device scsi-hd,drive=bootdisk,bus=scsi0.0\n"
 	#~ "hide" disk: device_id=scsiHDD,product=SCSI_disk,serial=$(uuidgen),vendor=ANY_disk,ver=1.0
+	# as we relys on ZFS its good idea to run into some limits to avoid arc overheating anyway
+	# throttling.bps-total=50331648,throttling.iops-total=1024
 }
 
 function template_iso() {
@@ -112,14 +109,14 @@ function template_usb() {
 	USBCLIUP=""
 	if [ "$VMUSB" != '-' ]; then
 		for i in "${!VMUSB[@]}"; do
-			local  device
-			local  OLDIFS=$IFS
+			local device
+			local OLDIFS=$IFS
 			IFS=":"
-			read  -a device <<< ${VMUSB[i]}
+			read -a device <<< ${VMUSB[i]}
 			IFS=$OLDIFS
-			local  usb_vid=${device[0]}
-			local  usb_pid=${device[1]}
-			local  sysfsdev=$(lsusb -d ${usb_vid}:${usb_pid})
+			local usb_vid=${device[0]}
+			local usb_pid=${device[1]}
+			local sysfsdev=$(lsusb -d ${usb_vid}:${usb_pid})
 			USBCLIUP="${USBCLIUP}sudo chown $VMUSER /dev/bus/usb/${sysfsdev:4:3}/${sysfsdev:15:3}\n"
 			QEMUOPTS="${QEMUOPTS} -device usb-host,vendorid=0x${usb_vid},productid=0x${usb_pid},bus=xhci.0 \\\\\n"
 		done
@@ -138,15 +135,15 @@ function template_pcie() {
 	if [ "$VMPCIEIDS" != '-' ]; then
 		PCIECLIUP="sudo modprobe -i vfio-pci\n"
 		for i in "${!VMPCIEIDS[@]}"; do
-			local  OLDIFS=$IFS
+			local OLDIFS=$IFS
 			IFS=,
-			local  dev
-			local  opts
-			read  dev opts <<< ${VMPCIEIDS[i]}
-			[  -h "/sys/bus/pci/devices/${dev}/driver/unbind" ] || PCIECLIUP="${PCIECLIUP}echo $dev | sudo tee \"/sys/bus/pci/devices/${dev}/driver/unbind\"\n"
+			local dev
+			local opts
+			read dev opts <<< ${VMPCIEIDS[i]}
+			[ -h "/sys/bus/pci/devices/${dev}/driver/unbind" ] || PCIECLIUP="${PCIECLIUP}echo $dev | sudo tee \"/sys/bus/pci/devices/${dev}/driver/unbind\"\n"
 			PCIECLIUP="${PCIECLIUP}echo vfio-pci | sudo tee \"/sys/bus/pci/devices/${dev}/driver_override\"\n"
 			PCIECLIUP="${PCIECLIUP}echo $dev | sudo tee \"/sys/bus/pci/drivers_probe\"\n"
-			PCIECLIUP="${PCIECLIUP}sudo chown $VMUSER /dev/vfio/$( basename $(readlink -m /sys/bus/pci/devices/${dev}/iommu_group))\n"
+			PCIECLIUP="${PCIECLIUP}sudo chown $VMUSER /dev/vfio/$(basename $(readlink -m /sys/bus/pci/devices/${dev}/iommu_group))\n"
 			QEMUOPTS="${QEMUOPTS} -device vfio-pci,host=${VMPCIEIDS[i]} \\\\\n"
 			IFS=$OLDIFS
 		done
@@ -157,13 +154,13 @@ function template_os() {
 	case $VMOS in
 		linux*)
 			QEMUOPTS="${QEMUOPTS} -nographic \\\\\n"
-			[  $VMCONSOLE == '-' ] || {
+			[ $VMCONSOLE == '-' ] || {
 				# screen //telnet localhost <port>
-				ss   -Htln src :$1 | grep LISTEN > /dev/null
-				if   [ $? == 0 ]; then
+				ss -Htln src :$1 | grep LISTEN > /dev/null
+				if [ $? == 0 ]; then
 					QEMUOPTS="${QEMUOPTS} -serial mon:telnet:localhost:${VMCONSOLE},server,nowait \\\\\n"
 				else
-					echo    "Console port already in use, terminating."
+					echo  "Console port already in use, terminating."
 				fi
 			}
 			template_iso
@@ -176,15 +173,15 @@ function template_os() {
 			template_efi
 			;;
 		linux-*)
-			echo  "BIOS type not defined, terminating"
+			echo "BIOS type not defined, terminating"
 			QEMUOPTS="NA"
 			;;
 		win*)
 			QEMUOPTS="${QEMUOPTS} -device qemu-xhci,id=xhci \\\\\n"
 			QEMUOPTS="${QEMUOPTS} -device usb-tablet,bus=xhci.0 \\\\\n"
 			QEMUOPTS="${QEMUOPTS} -monitor stdio \\\\\n"
-			template_iso  win
-			[  $VMCONSOLE == '-' ] || {
+			template_iso win
+			[ $VMCONSOLE == '-' ] || {
 				QEMUOPTS="${QEMUOPTS} -vga qxl \\\\\n"
 				QEMUOPTS="${QEMUOPTS} -device virtio-serial-pci \\\\\n"
 				QEMUOPTS="${QEMUOPTS} -spice port=$VMCONSOLE,disable-ticketing \\\\\n"
@@ -202,8 +199,6 @@ function template_os() {
 }
 
 #~ create blank.iso in $DATASTORE mountpoint
-DATASTOREMOUNTPOINT=$(zfs get -H -o value mountpoint $DATASTORE)
-BLANKISO="$DATASTOREMOUNTPOINT/blank.iso"
 [ -f $BLANKISO ] || {
 	mkdir /tmp/blank-iso_tmp_${DATEUNIX}
 	mkisofs -o $BLANKISO -V blank /tmp/blank-iso_tmp_${DATEUNIX}
